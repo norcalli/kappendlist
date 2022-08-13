@@ -1,4 +1,5 @@
 #![allow(dead_code)]
+use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::UnsafeCell;
 use std::fmt::{self, Debug};
 use std::iter::FromIterator;
@@ -166,21 +167,24 @@ impl<T> std::ops::Index<usize> for BaseAppendList<T, variants::Index> {
 
 struct Inner<T> {
     len: usize,
-    chunks: Vec<Chunk<T>>,
+    chunks: Vec<Chunk<T, CHUNK_SIZE>>,
 }
 
-struct Chunk<T>(*mut [MaybeUninit<T>; CHUNK_SIZE]);
+pub struct Chunk<T, const CHUNK_SIZE: usize>(*mut [MaybeUninit<T>; CHUNK_SIZE]);
 
-impl<T> Chunk<T> {
+impl<T, const CHUNK_SIZE: usize> Chunk<T, CHUNK_SIZE> {
     pub fn system_alloc(count: usize) -> impl Iterator<Item = Self> {
-        use std::alloc::{GlobalAlloc, Layout, System};
+        Self::alloc(count, |layout| unsafe { System.alloc(layout) })
+    }
+    pub fn alloc(
+        count: usize,
+        alloc: impl FnOnce(Layout) -> *mut u8,
+    ) -> impl Iterator<Item = Self> {
         // The memory layout of arrays is guaranteed to be compatible with
         // putting them next to eachother contiguously.
         // MaybeUninit has the same memory layout as T
-        let first_chunk = unsafe {
-            System.alloc(Layout::array::<T>(CHUNK_SIZE * count).unwrap())
-                as *mut [MaybeUninit<T>; CHUNK_SIZE]
-        };
+        let first_chunk = alloc(Layout::array::<T>(CHUNK_SIZE * count).unwrap())
+            as *mut [MaybeUninit<T>; CHUNK_SIZE];
         assert!(count <= isize::MAX as usize);
         std::iter::once(Chunk(tag_ptr(first_chunk, 1)))
             .chain((1..count).map(move |i| Chunk(unsafe { first_chunk.offset(i as isize) })))
@@ -205,8 +209,15 @@ impl<T> Chunk<T> {
     pub fn ptr(&self) -> *mut [MaybeUninit<T>; CHUNK_SIZE] {
         untagged(self.0)
     }
-    pub fn system_dealloc(chunks: &[Chunk<T>]) {
-        use std::alloc::{GlobalAlloc, Layout, System};
+
+    #[inline]
+    pub fn system_dealloc(chunks: &[Chunk<T, CHUNK_SIZE>]) {
+        Self::dealloc(chunks, |ptr, layout| unsafe {
+            System.dealloc(ptr, layout);
+        })
+    }
+
+    pub fn dealloc(chunks: &[Chunk<T, CHUNK_SIZE>], mut dealloc: impl FnMut(*mut u8, Layout)) {
         if chunks.is_empty() {
             return;
         }
@@ -220,9 +231,7 @@ impl<T> Chunk<T> {
             chunk_count += 1;
             if chunk.tag() == 1 {
                 let layout = Layout::array::<T>(CHUNK_SIZE * chunk_count).unwrap();
-                unsafe {
-                    System.dealloc(chunk.ptr().cast(), layout);
-                }
+                dealloc(chunk.ptr().cast(), layout);
                 chunk_count = 0;
             }
         }
