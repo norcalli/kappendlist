@@ -261,7 +261,7 @@ impl<T> Default for Inner<T> {
     }
 }
 
-const TAG_MASK: u64 = 0b111;
+pub const TAG_MASK: u64 = 0b111;
 #[inline(always)]
 pub fn modify_ptr<T>(p: *mut T, f: impl FnOnce(u64) -> u64) -> *mut T {
     f(p as u64) as *mut T
