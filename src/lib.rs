@@ -173,10 +173,10 @@ struct Inner<T> {
 pub struct Chunk<T, const CHUNK_SIZE: usize>(*mut [MaybeUninit<T>; CHUNK_SIZE]);
 
 impl<T, const CHUNK_SIZE: usize> Chunk<T, CHUNK_SIZE> {
-    pub fn system_alloc(count: usize) -> impl Iterator<Item = Self> {
-        Self::alloc(count, |layout| unsafe { System.alloc(layout) })
+    pub unsafe fn system_alloc(count: usize) -> impl Iterator<Item = Self> {
+        Self::alloc(count, |layout| System.alloc(layout))
     }
-    pub fn alloc(
+    pub unsafe fn alloc(
         count: usize,
         alloc: impl FnOnce(Layout) -> *mut u8,
     ) -> impl Iterator<Item = Self> {
@@ -187,7 +187,7 @@ impl<T, const CHUNK_SIZE: usize> Chunk<T, CHUNK_SIZE> {
             as *mut [MaybeUninit<T>; CHUNK_SIZE];
         assert!(count <= isize::MAX as usize);
         std::iter::once(Chunk(tag_ptr(first_chunk, 1)))
-            .chain((1..count).map(move |i| Chunk(unsafe { first_chunk.offset(i as isize) })))
+            .chain((1..count).map(move |i| Chunk(first_chunk.offset(i as isize))))
     }
     #[inline]
     pub fn tag(&self) -> u64 {
@@ -211,13 +211,14 @@ impl<T, const CHUNK_SIZE: usize> Chunk<T, CHUNK_SIZE> {
     }
 
     #[inline]
-    pub fn system_dealloc(chunks: &[Chunk<T, CHUNK_SIZE>]) {
-        Self::dealloc(chunks, |ptr, layout| unsafe {
-            System.dealloc(ptr, layout);
-        })
+    pub unsafe fn system_dealloc(chunks: &[Chunk<T, CHUNK_SIZE>]) {
+        Self::dealloc(chunks, |ptr, layout| System.dealloc(ptr, layout))
     }
 
-    pub fn dealloc(chunks: &[Chunk<T, CHUNK_SIZE>], mut dealloc: impl FnMut(*mut u8, Layout)) {
+    pub unsafe fn dealloc(
+        chunks: &[Chunk<T, CHUNK_SIZE>],
+        mut dealloc: impl FnMut(*mut u8, Layout),
+    ) {
         if chunks.is_empty() {
             return;
         }
@@ -336,7 +337,7 @@ impl<T> Inner<T> {
         if count == 0 {
             return;
         }
-        self.chunks.extend(Chunk::system_alloc(count));
+        self.chunks.extend(unsafe { Chunk::system_alloc(count) });
     }
 
     fn chunks_needed_maintaining_invariant(&self, total_chunk_count: usize) -> usize {
@@ -479,7 +480,9 @@ impl<T> Drop for Inner<T> {
             }
         }
         // Deallocate the actual array chunks
-        Chunk::system_dealloc(self.chunks.as_slice());
+        unsafe {
+            Chunk::system_dealloc(self.chunks.as_slice());
+        }
     }
 }
 
