@@ -263,19 +263,19 @@ impl<T> Default for Inner<T> {
 
 const TAG_MASK: u64 = 0b111;
 #[inline(always)]
-fn modify_ptr<T>(p: *mut T, f: impl FnOnce(u64) -> u64) -> *mut T {
+pub fn modify_ptr<T>(p: *mut T, f: impl FnOnce(u64) -> u64) -> *mut T {
     f(p as u64) as *mut T
 }
 #[inline(always)]
-fn get_ptr_tag<T>(p: *mut T) -> u64 {
+pub fn get_ptr_tag<T>(p: *mut T) -> u64 {
     p as u64 & TAG_MASK
 }
 #[inline(always)]
-fn untagged<T>(p: *mut T) -> *mut T {
+pub fn untagged<T>(p: *mut T) -> *mut T {
     modify_ptr(p, |v| v & (!TAG_MASK))
 }
 #[inline(always)]
-fn tag_ptr<T>(p: *mut T, tag: u64) -> *mut T {
+pub fn tag_ptr<T>(p: *mut T, tag: u64) -> *mut T {
     modify_ptr(p, |v| v | (tag & TAG_MASK))
 }
 
