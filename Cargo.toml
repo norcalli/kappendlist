@@ -1,14 +1,17 @@
 [package]
 name = "kappendlist"
 version = "0.1.0"
-edition = "2021"
-rust-version = "1.84"
+edition = "2024"
+rust-version = "1.85"
 description = "An append-only list you can push to through a shared reference while borrows of existing elements stay valid."
 repository = "https://github.com/norcalli/kappendlist"
 license = "MIT OR Apache-2.0"
 keywords = ["append", "list", "arena", "vec", "no-move"]
-categories = ["data-structures", "memory-management"]
+categories = ["data-structures", "memory-management", "no-std"]
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
+
+[dev-dependencies]
+proptest = "1"

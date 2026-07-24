@@ -11,6 +11,9 @@
 //! Indexing is O(1): the element at `index` lives at chunk `index / 16`, offset
 //! `index % 16`.
 //!
+//! This crate is `#![no_std]` (it only needs `alloc`) and uses the global
+//! allocator, so it honors a custom `#[global_allocator]`.
+//!
 //! # Variants
 //!
 //! Two type aliases are provided over the shared implementation:
@@ -67,13 +70,23 @@
 //! Zero-sized types are not supported (there is nothing to allocate); attempting
 //! to push a ZST panics at monomorphization time.
 
-use std::alloc::{handle_alloc_error, GlobalAlloc, Layout, System};
-use std::cell::UnsafeCell;
-use std::fmt::{self, Debug};
-use std::iter::FromIterator;
-use std::marker::PhantomData;
-use std::mem::MaybeUninit;
-use std::ops::Index;
+#![no_std]
+#![deny(missing_docs)]
+#![deny(unsafe_op_in_unsafe_fn)]
+
+extern crate alloc;
+#[cfg(test)]
+#[macro_use]
+extern crate std;
+
+use alloc::alloc::{Layout, alloc as global_alloc, dealloc as global_dealloc, handle_alloc_error};
+use alloc::vec::Vec;
+use core::cell::UnsafeCell;
+use core::fmt::{self, Debug};
+use core::iter::{FromIterator, FusedIterator};
+use core::marker::PhantomData;
+use core::mem::MaybeUninit;
+use core::ops::{Index, IndexMut};
 
 /// Number of elements per chunk. Must be a power of two.
 const CHUNK_SIZE: usize = 16;
@@ -122,6 +135,18 @@ impl<T, V> Default for BaseAppendList<T, V> {
     }
 }
 
+impl<T: Clone, V> Clone for BaseAppendList<T, V> {
+    fn clone(&self) -> Self {
+        let out = Self::default();
+        // SAFETY: the reborrow is dropped before this returns and does not
+        // overlap any element reference (see `inner_mut`).
+        let dst = unsafe { out.inner_mut() };
+        let src = self.inner();
+        dst.extend((0..src.len()).map(|i| src.get(i).unwrap().clone()));
+        out
+    }
+}
+
 impl<T, V> BaseAppendList<T, V> {
     /// Create a new, empty list. No allocation happens until the first push.
     #[inline]
@@ -130,10 +155,6 @@ impl<T, V> BaseAppendList<T, V> {
     }
 
     /// Borrow the inner state immutably.
-    ///
-    /// # Safety
-    /// The caller must not create a `&mut Inner` (via [`inner_mut`]) that
-    /// overlaps the returned borrow.
     #[inline(always)]
     fn inner(&self) -> &Inner<T> {
         // SAFETY: read-only access; no `&mut Inner` is live for the returned
@@ -152,7 +173,8 @@ impl<T, V> BaseAppendList<T, V> {
     #[inline(always)]
     #[allow(clippy::mut_from_ref)] // interior mutability is the whole point
     unsafe fn inner_mut(&self) -> &mut Inner<T> {
-        &mut *self.inner.get()
+        // SAFETY: forwarded to the caller (see the method's `# Safety`).
+        unsafe { &mut *self.inner.get() }
     }
 
     /// Get a mutable reference to the item at `index`, if it is in bounds.
@@ -164,14 +186,17 @@ impl<T, V> BaseAppendList<T, V> {
     /// Get an iterator yielding `&mut T` over every element.
     #[inline]
     pub fn iter_mut(&mut self) -> IterMut<'_, T> {
+        let end = self.len();
         IterMut {
             inner: self.inner.get(),
             index: 0,
+            end,
             _marker: PhantomData,
         }
     }
 
-    /// Move every element out of the list, leaving it empty.
+    /// Move every element out of the list, leaving it empty (but keeping its
+    /// allocated capacity).
     ///
     /// Elements not yielded before the [`Drain`] is dropped are dropped in
     /// place, exactly like [`Vec::drain`].
@@ -188,6 +213,14 @@ impl<T, V> BaseAppendList<T, V> {
             len,
             _marker: PhantomData,
         }
+    }
+
+    /// Remove every element, dropping them in place while keeping capacity.
+    #[inline]
+    pub fn clear(&mut self) {
+        // The returned `Drain` drops all remaining elements when it falls out
+        // of scope here.
+        self.drain_all();
     }
 
     /// The number of elements currently in the list.
@@ -208,13 +241,24 @@ impl<T, V> BaseAppendList<T, V> {
         self.len() == 0
     }
 
+    /// Reserve capacity for at least `additional` more elements.
+    ///
+    /// Existing chunks are never moved, so this only ever *adds* storage. Takes
+    /// `&self`, so it can be called while elements are borrowed.
+    #[inline]
+    pub fn reserve(&self, additional: usize) {
+        // SAFETY: the reborrow is dropped before this returns and does not
+        // overlap any element reference (see `inner_mut`).
+        unsafe { self.inner_mut() }.reserve(additional)
+    }
+
     /// Append every item of `iter` to the end of the list.
     ///
     /// Note that this takes `&self`, so it can be called while elements are
     /// borrowed.
     #[inline]
     pub fn extend<I: IntoIterator<Item = T>>(&self, iter: I) {
-        // SAFETY: the reborrow is dropped before this call returns and does not
+        // SAFETY: the reborrow is dropped before this returns and does not
         // overlap any element reference (see `inner_mut`).
         unsafe { self.inner_mut() }.extend(iter)
     }
@@ -284,6 +328,15 @@ impl<T> Index<usize> for BaseAppendList<T, variants::Index> {
     }
 }
 
+impl<T> IndexMut<usize> for BaseAppendList<T, variants::Index> {
+    #[inline]
+    fn index_mut(&mut self, idx: usize) -> &mut T {
+        let len = self.len();
+        self.get_mut(idx)
+            .unwrap_or_else(|| panic!("index {idx} out of bounds for list of length {len}"))
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Inner storage
 // ---------------------------------------------------------------------------
@@ -314,19 +367,23 @@ impl<T> Inner<T> {
         self.chunks.len() * CHUNK_SIZE
     }
 
-    /// Raw pointer to the slot at `index`. Caller guarantees the chunk exists.
+    /// Raw pointer to the slot at `index`.
+    ///
+    /// # Safety
+    /// The chunk holding `index` must already exist (`index < capacity`).
     #[inline(always)]
     unsafe fn slot(&self, index: usize) -> *mut MaybeUninit<T> {
         let chunk_index = index / CHUNK_SIZE;
         let index_in_chunk = index & CHUNK_MASK;
-        self.chunks.get_unchecked(chunk_index).slot(index_in_chunk)
+        // SAFETY: caller guarantees the chunk exists; `index_in_chunk < CHUNK_SIZE`.
+        unsafe { self.chunks.get_unchecked(chunk_index).slot(index_in_chunk) }
     }
 
     fn push(&mut self, item: T) -> &mut T {
         // Zero-sized types have no storage to point stable references at.
         const {
             assert!(
-                std::mem::size_of::<T>() != 0,
+                core::mem::size_of::<T>() != 0,
                 "kappendlist does not support zero-sized types"
             )
         };
@@ -334,7 +391,7 @@ impl<T> Inner<T> {
         let index = self.len;
         if index / CHUNK_SIZE >= self.chunks.len() {
             // Double the number of chunks (allocate `len + 1` more). See
-            // `chunks_to_reach` for the geometric-growth rationale.
+            // `Chunk::alloc_batch` and the growth notes there.
             self.allocate_chunks(self.chunks.len() + 1);
         }
 
@@ -372,7 +429,8 @@ impl<T> Inner<T> {
     /// `index` must be in bounds and the slot must not be read again.
     #[inline(always)]
     unsafe fn take(&mut self, index: usize) -> T {
-        (*self.slot(index)).assume_init_read()
+        // SAFETY: forwarded to the caller.
+        unsafe { (*self.slot(index)).assume_init_read() }
     }
 
     fn allocate_chunks(&mut self, count: usize) {
@@ -384,7 +442,23 @@ impl<T> Inner<T> {
         self.chunks.extend(unsafe { Chunk::alloc_batch(count) });
     }
 
+    /// Ensure there is room for `additional` more elements beyond `len`.
+    fn reserve(&mut self, additional: usize) {
+        let target_len = self
+            .len
+            .checked_add(additional)
+            .expect("kappendlist capacity overflow");
+        let needed_chunks = target_len.div_ceil(CHUNK_SIZE);
+        if needed_chunks > self.chunks.len() {
+            // A single contiguous batch of exactly the shortfall; the tag scheme
+            // handles batches of any size.
+            self.allocate_chunks(needed_chunks - self.chunks.len());
+        }
+    }
+
     fn extend<I: IntoIterator<Item = T>>(&mut self, iter: I) {
+        let iter = iter.into_iter();
+        self.reserve(iter.size_hint().0);
         for x in iter {
             self.push(x);
         }
@@ -432,7 +506,10 @@ struct Chunk<T> {
 /// [`TAG_ALIGN`] so the low bits are free for tagging.
 #[inline]
 fn batch_layout<T>(count: usize) -> Layout {
-    Layout::array::<T>(CHUNK_SIZE * count)
+    let elems = CHUNK_SIZE
+        .checked_mul(count)
+        .expect("kappendlist capacity overflow");
+    Layout::array::<T>(elems)
         .expect("chunk layout size overflow")
         .align_to(TAG_ALIGN)
         .expect("chunk layout alignment overflow")
@@ -447,7 +524,9 @@ impl<T> Chunk<T> {
     unsafe fn alloc_batch(count: usize) -> impl Iterator<Item = Chunk<T>> {
         debug_assert!(count >= 1);
         let layout = batch_layout::<T>(count);
-        let base = System.alloc(layout) as *mut MaybeUninit<T>;
+        // SAFETY: `count >= 1` and `T` is not a ZST (checked in `push`), so the
+        // layout has non-zero size.
+        let base = unsafe { global_alloc(layout) } as *mut MaybeUninit<T>;
         if base.is_null() {
             handle_alloc_error(layout);
         }
@@ -458,11 +537,13 @@ impl<T> Chunk<T> {
         );
         // The first chunk holds the tagged pointer; the rest are plain offsets
         // (by whole chunks) into the same allocation.
-        std::iter::once(Chunk {
+        core::iter::once(Chunk {
             ptr: with_tag(base, 1),
         })
         .chain((1..count).map(move |i| Chunk {
-            ptr: base.add(i * CHUNK_SIZE),
+            // SAFETY: `i < count`, so `i * CHUNK_SIZE` stays within the batch
+            // allocation of `count * CHUNK_SIZE` elements.
+            ptr: unsafe { base.add(i * CHUNK_SIZE) },
         }))
     }
 
@@ -485,7 +566,8 @@ impl<T> Chunk<T> {
     #[inline(always)]
     unsafe fn slot(&self, i: usize) -> *mut MaybeUninit<T> {
         debug_assert!(i < CHUNK_SIZE);
-        self.base().add(i)
+        // SAFETY: caller guarantees `i < CHUNK_SIZE`, within this chunk's buffer.
+        unsafe { self.base().add(i) }
     }
 
     /// Free every batch backing `chunks`.
@@ -504,7 +586,9 @@ impl<T> Chunk<T> {
         for chunk in chunks.iter().rev() {
             count += 1;
             if chunk.tag() == 1 {
-                System.dealloc(chunk.base().cast(), batch_layout::<T>(count));
+                // SAFETY: `chunk` is a batch head allocated with this exact
+                // layout by `alloc_batch`, and is freed exactly once.
+                unsafe { global_dealloc(chunk.base().cast(), batch_layout::<T>(count)) };
                 count = 0;
             }
         }
@@ -532,32 +616,6 @@ fn untag<T>(p: *mut T) -> *mut T {
 #[inline(always)]
 fn with_tag<T>(p: *mut T, tag: usize) -> *mut T {
     p.map_addr(|a| a | (tag & TAG_MASK))
-}
-
-// ---------------------------------------------------------------------------
-// Growth math
-// ---------------------------------------------------------------------------
-
-/// Total chunks a doubling-growth list ends up with once it holds at least
-/// `wanted` chunks.
-///
-/// Growth adds `len + 1` chunks each time (so `new = 2*len + 1`), producing the
-/// sequence `0, 1, 3, 7, 15, …` — i.e. `2^n - 1`. This returns the smallest
-/// such total `>= wanted`. Used to verify the growth invariants in tests.
-#[cfg(test)]
-fn chunks_to_reach(wanted: usize) -> usize {
-    let mut total = 0;
-    while total < wanted {
-        total = (total << 1) + 1;
-    }
-    total
-}
-
-/// `ceil(log2(x))` for `x >= 1`.
-#[cfg(test)]
-fn ceil_log2(x: usize) -> usize {
-    debug_assert!(x >= 1);
-    (usize::BITS - x.leading_zeros()) as usize
 }
 
 // ---------------------------------------------------------------------------
@@ -589,6 +647,25 @@ impl<'a, T> IntoIterator for &'a BaseAppendList<T, variants::Index> {
     }
 }
 
+impl<T, V> IntoIterator for BaseAppendList<T, V> {
+    type Item = T;
+    type IntoIter = IntoIter<T>;
+
+    #[inline]
+    fn into_iter(self) -> Self::IntoIter {
+        let mut inner = self.inner.into_inner();
+        let len = inner.len;
+        // The `IntoIter` takes over responsibility for dropping the elements, so
+        // stop `Inner`'s own `Drop` from also dropping them.
+        inner.len = 0;
+        IntoIter {
+            inner,
+            index: 0,
+            len,
+        }
+    }
+}
+
 impl<T: PartialEq> PartialEq for BaseAppendList<T, variants::Index> {
     fn eq(&self, other: &Self) -> bool {
         if self.len() != other.len() {
@@ -613,7 +690,9 @@ impl<T: Debug> Debug for BaseAppendList<T, variants::Index> {
 /// Shared iterator returned by [`AppendList::iter`].
 ///
 /// Holds a raw pointer to the list's inner state (rather than a `&Inner`) so
-/// that appending to the list mid-iteration does not invalidate it.
+/// that appending to the list mid-iteration does not invalidate it. Because the
+/// list may grow during iteration, this iterator is intentionally neither
+/// [`ExactSizeIterator`] nor [`FusedIterator`].
 pub struct Iter<'a, T> {
     inner: *const Inner<T>,
     index: usize,
@@ -636,15 +715,21 @@ impl<'a, T> Iterator for Iter<'a, T> {
 
     #[inline]
     fn size_hint(&self) -> (usize, Option<usize>) {
+        // SAFETY: `inner` is valid for `'a`.
         let remaining = unsafe { &*self.inner }.len().saturating_sub(self.index);
         (remaining, Some(remaining))
     }
 }
 
 /// Mutable iterator returned by [`BaseAppendList::iter_mut`].
+///
+/// Created from `&mut self`, so the list cannot grow while it is alive; its
+/// length is therefore fixed and it is a well-behaved exact-size, fused,
+/// double-ended iterator.
 pub struct IterMut<'a, T> {
     inner: *mut Inner<T>,
     index: usize,
+    end: usize,
     _marker: PhantomData<&'a mut Inner<T>>,
 }
 
@@ -653,21 +738,41 @@ impl<'a, T> Iterator for IterMut<'a, T> {
 
     #[inline]
     fn next(&mut self) -> Option<&'a mut T> {
+        if self.index >= self.end {
+            return None;
+        }
         // SAFETY: created from `&'a mut self`, so we have exclusive access for
         // `'a`. Each call yields a `&mut` to a distinct slot, so the extended
         // borrows never alias.
         let inner = unsafe { &mut *self.inner };
-        let item = inner.get_mut(self.index)?;
+        let item = inner.get_mut(self.index).unwrap();
         self.index += 1;
         Some(unsafe { &mut *(item as *mut T) })
     }
 
     #[inline]
     fn size_hint(&self) -> (usize, Option<usize>) {
-        let remaining = unsafe { &*self.inner }.len().saturating_sub(self.index);
+        let remaining = self.end - self.index;
         (remaining, Some(remaining))
     }
 }
+
+impl<'a, T> DoubleEndedIterator for IterMut<'a, T> {
+    #[inline]
+    fn next_back(&mut self) -> Option<&'a mut T> {
+        if self.index >= self.end {
+            return None;
+        }
+        self.end -= 1;
+        // SAFETY: as `next`; `self.end` is a distinct, in-bounds index.
+        let inner = unsafe { &mut *self.inner };
+        let item = inner.get_mut(self.end).unwrap();
+        Some(unsafe { &mut *(item as *mut T) })
+    }
+}
+
+impl<T> ExactSizeIterator for IterMut<'_, T> {}
+impl<T> FusedIterator for IterMut<'_, T> {}
 
 /// By-value draining iterator returned by [`BaseAppendList::drain_all`].
 ///
@@ -701,7 +806,20 @@ impl<T> Iterator for Drain<'_, T> {
     }
 }
 
+impl<T> DoubleEndedIterator for Drain<'_, T> {
+    #[inline]
+    fn next_back(&mut self) -> Option<T> {
+        if self.index >= self.len {
+            return None;
+        }
+        self.len -= 1;
+        // SAFETY: `len` now points at an initialized, not-yet-moved slot.
+        Some(unsafe { (*self.inner).take(self.len) })
+    }
+}
+
 impl<T> ExactSizeIterator for Drain<'_, T> {}
+impl<T> FusedIterator for Drain<'_, T> {}
 
 impl<T> Drop for Drain<'_, T> {
     fn drop(&mut self) {
@@ -714,9 +832,70 @@ impl<T> Drop for Drain<'_, T> {
     }
 }
 
+/// By-value consuming iterator returned by `into_iter` on an owned list.
+pub struct IntoIter<T> {
+    inner: Inner<T>,
+    index: usize,
+    len: usize,
+}
+
+impl<T> Iterator for IntoIter<T> {
+    type Item = T;
+
+    #[inline]
+    fn next(&mut self) -> Option<T> {
+        if self.index >= self.len {
+            return None;
+        }
+        // SAFETY: `index < len`, so the slot is initialized and not yet moved.
+        let item = unsafe { self.inner.take(self.index) };
+        self.index += 1;
+        Some(item)
+    }
+
+    #[inline]
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let remaining = self.len - self.index;
+        (remaining, Some(remaining))
+    }
+}
+
+impl<T> DoubleEndedIterator for IntoIter<T> {
+    #[inline]
+    fn next_back(&mut self) -> Option<T> {
+        if self.index >= self.len {
+            return None;
+        }
+        self.len -= 1;
+        // SAFETY: `len` now points at an initialized, not-yet-moved slot.
+        Some(unsafe { self.inner.take(self.len) })
+    }
+}
+
+impl<T> ExactSizeIterator for IntoIter<T> {}
+impl<T> FusedIterator for IntoIter<T> {}
+
+impl<T> Drop for IntoIter<T> {
+    fn drop(&mut self) {
+        // Drop the elements that were never yielded. `self.inner.len` was set to
+        // 0 at construction, so `Inner::drop` will only free the chunks.
+        for index in self.index..self.len {
+            // SAFETY: these slots are initialized and not yet moved out.
+            unsafe { self.inner.take(index) };
+        }
+    }
+}
+
+// Compile the README's code examples as doctests without changing the rendered
+// crate documentation. Keeps the README examples from rotting.
+#[cfg(doctest)]
+#[doc = include_str!("../README.md")]
+struct ReadmeDoctests;
+
 #[cfg(test)]
 mod test {
     use super::*;
+    use std::rc::Rc;
 
     #[test]
     fn from_iterator() {
@@ -730,8 +909,9 @@ mod test {
     #[test]
     fn iterator() {
         let l: AppendList<i32> = (0..100).collect();
+        // Both `iter()` and `(&list).into_iter()` yield shared references.
         let mut i1 = l.iter();
-        let mut i2 = l.into_iter();
+        let mut i2 = (&l).into_iter();
 
         for item in 0..100 {
             assert_eq!(i1.next(), Some(&item));
@@ -767,6 +947,71 @@ mod test {
     fn debug_format() {
         let l: AppendList<i32> = (0..3).collect();
         assert_eq!(format!("{l:?}"), "[0, 1, 2]");
+    }
+
+    #[test]
+    fn clone_is_independent() {
+        let a: AppendList<i32> = (0..50).collect();
+        let b = a.clone();
+        assert_eq!(a, b);
+        a.push(999);
+        assert_eq!(a.len(), 51);
+        assert_eq!(b.len(), 50);
+    }
+
+    #[test]
+    fn clear_keeps_capacity() {
+        let mut l: AppendList<i32> = (0..100).collect();
+        let cap = l.capacity();
+        l.clear();
+        assert!(l.is_empty());
+        assert_eq!(l.capacity(), cap);
+        l.push(7);
+        assert_eq!(l[0], 7);
+    }
+
+    #[test]
+    fn into_iter_owned() {
+        let l: AppendList<i32> = (0..10).collect();
+        assert_eq!(
+            l.into_iter().collect::<Vec<_>>(),
+            (0..10).collect::<Vec<_>>()
+        );
+
+        // Partial consumption still drops the rest exactly once.
+        let counter = Rc::new(std::cell::Cell::new(0));
+        struct Bomb(Rc<std::cell::Cell<usize>>);
+        impl Drop for Bomb {
+            fn drop(&mut self) {
+                self.0.set(self.0.get() + 1);
+            }
+        }
+        let l = AppendList::new();
+        for _ in 0..10 {
+            l.push(Bomb(counter.clone()));
+        }
+        let mut it = l.into_iter();
+        drop(it.next());
+        drop(it.next());
+        drop(it);
+        assert_eq!(counter.get(), 10);
+    }
+
+    #[test]
+    fn double_ended_iters() {
+        let mut l: AppendList<i32> = (0..6).collect();
+        assert_eq!(
+            l.iter_mut().rev().map(|x| *x).collect::<Vec<_>>(),
+            vec![5, 4, 3, 2, 1, 0]
+        );
+        assert_eq!(
+            l.into_iter().rev().collect::<Vec<_>>(),
+            vec![5, 4, 3, 2, 1, 0]
+        );
+
+        let mut l: AppendList<i32> = (0..6).collect();
+        let drained: Vec<i32> = l.drain_all().rev().collect();
+        assert_eq!(drained, vec![5, 4, 3, 2, 1, 0]);
     }
 
     #[test]
@@ -828,6 +1073,21 @@ mod test {
     }
 
     #[test]
+    fn reserve_then_push_keeps_addresses() {
+        let l = AppendList::new();
+        l.reserve(1000);
+        let cap = l.capacity();
+        assert!(cap >= 1000);
+        let first = l.push(1);
+        // Pushing up to the reserved capacity must not reallocate.
+        for i in 2..=cap {
+            l.push(i);
+        }
+        assert_eq!(*first, 1);
+        assert_eq!(l.capacity(), cap);
+    }
+
+    #[test]
     fn small_alignment_type() {
         // `u8` has alignment 1; the allocator must still hand back an
         // 8-aligned buffer (we over-align) so pointer tagging is sound.
@@ -871,7 +1131,6 @@ mod test {
     #[test]
     fn drain_partial_drops_remainder() {
         use std::cell::Cell;
-        use std::rc::Rc;
 
         let counter = Rc::new(Cell::new(0));
 
@@ -960,7 +1219,7 @@ mod test {
     }
 
     /// Check the chunk-tagging invariants for a list that has held (at its high
-    /// water mark) `element_count` elements.
+    /// water mark) `element_count` elements via single pushes.
     fn check_chunk_invariants(l: &AppendList<usize>, element_count: usize) {
         let inner = l.inner();
         // The number of chunks matches the growth formula.
@@ -975,5 +1234,21 @@ mod test {
         );
         // Tags are only ever 0 or 1.
         assert_eq!(inner.chunks.iter().filter(|c| c.tag() > 1).count(), 0);
+    }
+
+    /// Total chunks a pure doubling-growth list ends up with once it holds at
+    /// least `wanted` chunks: the smallest `2^n - 1 >= wanted`.
+    fn chunks_to_reach(wanted: usize) -> usize {
+        let mut total = 0;
+        while total < wanted {
+            total = (total << 1) + 1;
+        }
+        total
+    }
+
+    /// `ceil(log2(x))` for `x >= 1`.
+    fn ceil_log2(x: usize) -> usize {
+        debug_assert!(x >= 1);
+        (usize::BITS - x.leading_zeros()) as usize
     }
 }

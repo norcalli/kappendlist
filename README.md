@@ -37,12 +37,17 @@ Indexing is **O(1)**: element `i` lives in chunk `i / 16` at offset `i % 16`.
 | `AppendList<T>`   | `&T`           | `get`, `iter`, `Index` (`[]`)    |
 | `AppendListMut<T>`| `&mut T`       | (each push yields a unique `&mut`)|
 
-Both are aliases over `BaseAppendList<T, V>`. `&mut self` methods
-(`get_mut`, `iter_mut`, `drain_all`) are available on both.
+Both are aliases over `BaseAppendList<T, V>`. Shared-`&self` methods
+(`push`, `get`, `iter`, `extend`, `reserve`) let you keep borrows alive; the
+`&mut self` methods (`get_mut`, `iter_mut`, `drain_all`, `clear`, `IndexMut`) are
+available on both. `Clone`, `Debug`, `PartialEq`, `FromIterator`, and by-value
+`IntoIterator` are implemented too.
 
 ## Guarantees & limitations
 
 - **Stable addresses.** References from `push`/`get` survive later pushes.
+- **`#![no_std]`.** Only requires `alloc`, and allocates via the global
+  allocator, so a custom `#[global_allocator]` is honored.
 - **`Send` when `T: Send`.** The whole list can be moved between threads.
 - **Not `Sync`.** Appending through `&self` is unsynchronized, so a list must not
   be *shared* across threads. For a thread-safe append-only vector use

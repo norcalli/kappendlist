@@ -1,0 +1,67 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    name: Test Suite
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      # Run formatting check
+      - name: Check formatting
+        run: cargo fmt --all --check
+
+      # Run clippy lints with strict warnings
+      - name: Run clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      # Run unit and integration tests
+      - name: Run tests
+        run: cargo test --all-targets
+
+      # Run documentation tests
+      - name: Run doc tests
+        run: cargo test --doc
+
+      # Build and check documentation
+      - name: Build documentation
+        run: cargo doc --no-deps
+        env:
+          RUSTDOCFLAGS: "-D warnings"
+
+  miri:
+    name: Miri
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: miri
+
+      # Initialize miri
+      - name: Setup miri
+        run: cargo miri setup
+
+      # Miri checks soundness of the unsafe core; the library unit tests
+      # exercise every unsafe path. The integration proptests are logic tests
+      # (run under normal `cargo test`) and are excluded here — interpreting
+      # their O(n^2) checks under Miri is needlessly slow and memory-hungry.
+
+      # Run the library tests under Stacked Borrows (default)
+      - name: Run miri tests (Stacked Borrows)
+        run: cargo miri test --lib
+
+      # Run the library tests under Tree Borrows
+      - name: Run miri tests (Tree Borrows)
+        run: cargo miri test --lib
+        env:
+          MIRIFLAGS: "-Zmiri-tree-borrows"
