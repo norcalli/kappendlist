@@ -693,6 +693,10 @@ impl<T: Debug> Debug for BaseAppendList<T, variants::Index> {
 /// that appending to the list mid-iteration does not invalidate it. Because the
 /// list may grow during iteration, this iterator is intentionally neither
 /// [`ExactSizeIterator`] nor [`FusedIterator`].
+///
+/// Element-wise `next` uses the simple indexed path. A chunk-walking iterator
+/// and a `fold` override were both tried and benchmarked; the optimizer already
+/// vectorizes this simple loop better than either, so the simple version stays.
 pub struct Iter<'a, T> {
     inner: *const Inner<T>,
     index: usize,
@@ -1126,6 +1130,26 @@ mod test {
             seen.push(*x);
         }
         assert_eq!(seen, vec![0, 1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn append_while_iterating_across_chunks() {
+        // Start with 20 elements (spanning chunk 0 and into chunk 1), consume
+        // part of chunk 0, then append across several more chunk boundaries and
+        // finish. Exercises the chunk-aware iterator's refresh path.
+        let l: AppendList<usize> = (0..20).collect();
+        let mut seen = Vec::new();
+        let mut it = l.iter();
+        for _ in 0..10 {
+            seen.push(*it.next().unwrap());
+        }
+        for x in 20..100 {
+            l.push(x);
+        }
+        for x in it {
+            seen.push(*x);
+        }
+        assert_eq!(seen, (0..100).collect::<Vec<_>>());
     }
 
     #[test]
