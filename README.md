@@ -23,12 +23,17 @@ A `Vec<T>` cannot hand out a `&T` and then let you `push`: growing the vector ma
 reallocate its buffer and move every element, dangling the reference. The borrow
 checker forbids it for exactly this reason.
 
-`kappendlist` stores elements in fixed-size chunks (16 elements each) that are
-allocated in geometrically growing batches and **never moved or reallocated**
-once created. Because element storage is stable, a reference returned by `push`
-(or `get`) stays valid for as long as the list lives — even as you keep pushing.
+`kappendlist` stores elements in geometrically growing batches (16, 32, 64, …
+elements) that are **never moved or reallocated** once allocated. Because element
+storage is stable, a reference returned by `push` (or `get`) stays valid for as
+long as the list lives — even as you keep pushing.
 
-Indexing is **O(1)**: element `i` lives in chunk `i / 16` at offset `i % 16`.
+Indexing is **O(1)** and needs no side table: batch `b` holds `16 << b` elements
+starting at index `16 * (2^b - 1)`, so an index maps to its batch with a
+`leading_zeros` and to a slot with a single load of that batch's base pointer.
+Push is a pointer bump against a cached cursor, and `iter()` walks a batch at a
+time — as a slice, so `sum`, `for_each`, `collect` and friends vectorize the way
+they do for `Vec`.
 
 ## Variants
 
@@ -59,7 +64,7 @@ available on both. `Clone`, `Debug`, `PartialEq`, `FromIterator`, and by-value
 ## Correctness
 
 This crate contains `unsafe` code (interior mutability, manual allocation, and
-pointer tagging to track allocation batches). The test suite passes under
+raw-pointer element access). The test suite passes under
 [Miri](https://github.com/rust-lang/miri) with **strict provenance**, under both
 **Stacked Borrows** and **Tree Borrows**:
 
@@ -68,9 +73,10 @@ cargo +nightly miri test
 MIRIFLAGS="-Zmiri-tree-borrows" cargo +nightly miri test
 ```
 
-Chunk buffers are over-aligned to 8 bytes so the low bits used for pointer
-tagging are always free, and all address arithmetic uses provenance-preserving
-`map_addr`, so tagging is sound even for small-alignment element types like `u8`.
+Batch base pointers are stored biased by the batch's first element index, so a
+slot is one load plus one add. The bias is applied with `wrapping_sub`/
+`wrapping_add`, which preserves provenance: every dereference happens through a
+pointer that has been unbiased back into its own allocation.
 
 ## How it compares
 

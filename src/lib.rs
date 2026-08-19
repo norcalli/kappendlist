@@ -1,15 +1,16 @@
 //! A growable list you can append to through a shared `&self` reference while
 //! references to existing elements stay alive.
 //!
-//! Elements are stored in fixed-size chunks (16 elements each) that are
-//! allocated in geometrically growing batches and **never moved or reallocated**
-//! once created. Because element storage is stable, a reference returned by
-//! [`push`](AppendList::push) (or [`get`](AppendList::get)) remains valid across
-//! later pushes — the thing that a plain `Vec` cannot promise, since growing a
-//! `Vec` may move its buffer.
+//! Elements are stored in geometrically growing batches (16, 32, 64, … elements)
+//! that are **never moved or reallocated** once allocated. Because element
+//! storage is stable, a reference returned by [`push`](AppendList::push) (or
+//! [`get`](AppendList::get)) remains valid across later pushes — the thing that a
+//! plain `Vec` cannot promise, since growing a `Vec` may move its buffer.
 //!
-//! Indexing is O(1): the element at `index` lives at chunk `index / 16`, offset
-//! `index % 16`.
+//! Indexing is O(1) and table-free: batch `b` holds `16 << b` elements starting
+//! at index `16 * (2^b - 1)`, so an index maps to its batch with a
+//! `leading_zeros` and two shifts, then to a slot with a single load of that
+//! batch's base pointer.
 //!
 //! This crate is `#![no_std]` (it only needs `alloc`) and uses the global
 //! allocator, so it honors a custom `#[global_allocator]`.
@@ -67,8 +68,8 @@
 //!
 //! # Limitations
 //!
-//! Zero-sized types are not supported (there is nothing to allocate); attempting
-//! to push a ZST panics at monomorphization time.
+//! Zero-sized types are not supported (there is nothing to allocate); using one
+//! panics at monomorphization time.
 
 #![no_std]
 #![deny(missing_docs)]
@@ -87,12 +88,6 @@ use core::iter::{FromIterator, FusedIterator};
 use core::marker::PhantomData;
 use core::mem::MaybeUninit;
 use core::ops::{Index, IndexMut};
-
-/// Number of elements per chunk. Must be a power of two.
-const CHUNK_SIZE: usize = 16;
-const CHUNK_MASK: usize = CHUNK_SIZE - 1;
-
-const _: () = assert!(CHUNK_SIZE.is_power_of_two());
 
 /// A list that can be appended to while its elements are borrowed.
 ///
@@ -142,7 +137,8 @@ impl<T: Clone, V> Clone for BaseAppendList<T, V> {
         // overlap any element reference (see `inner_mut`).
         let dst = unsafe { out.inner_mut() };
         let src = self.inner();
-        dst.extend((0..src.len()).map(|i| src.get(i).unwrap().clone()));
+        // `Iter` walks whole batches at a time, which beats `get`-per-index.
+        dst.extend(Iter::new(src).cloned());
         out
     }
 }
@@ -207,6 +203,7 @@ impl<T, V> BaseAppendList<T, V> {
         // Reset the length up-front so that if the `Drain` (or a panicking
         // element `Drop`) leaks, no element is dropped twice.
         inner.len = 0;
+        inner.rewind_cursor();
         Drain {
             inner: inner as *mut Inner<T>,
             index: 0,
@@ -243,8 +240,14 @@ impl<T, V> BaseAppendList<T, V> {
 
     /// Reserve capacity for at least `additional` more elements.
     ///
-    /// Existing chunks are never moved, so this only ever *adds* storage. Takes
-    /// `&self`, so it can be called while elements are borrowed.
+    /// Existing batches are never moved, so this only ever *adds* storage.
+    /// Capacity always lands on a batch boundary (`16 * (2^n - 1)` elements), so
+    /// this rounds up to the next one and may reserve up to twice what was asked
+    /// for — the same growth schedule repeated pushes would have followed. Slots
+    /// that are never pushed to are never written, so the rounding costs address
+    /// space rather than resident memory.
+    ///
+    /// Takes `&self`, so it can be called while elements are borrowed.
     #[inline]
     pub fn reserve(&self, additional: usize) {
         // SAFETY: the reborrow is dropped before this returns and does not
@@ -306,11 +309,7 @@ impl<T> BaseAppendList<T, variants::Index> {
     /// the list while iterating is sound and observes the newly pushed items.
     #[inline]
     pub fn iter(&self) -> Iter<'_, T> {
-        Iter {
-            inner: self.inner.get(),
-            index: 0,
-            _marker: PhantomData,
-        }
+        Iter::new(self.inner.get())
     }
 }
 
@@ -319,22 +318,34 @@ impl<T> Index<usize> for BaseAppendList<T, variants::Index> {
 
     #[inline]
     fn index(&self, idx: usize) -> &T {
-        self.get(idx).unwrap_or_else(|| {
-            panic!(
-                "index {idx} out of bounds for list of length {}",
-                self.len()
-            )
-        })
+        let inner = self.inner();
+        if idx >= inner.len() {
+            index_out_of_bounds(idx, inner.len());
+        }
+        // SAFETY: bounds-checked just above, so the slot exists and is
+        // initialized; we form a `&` to that single slot only.
+        unsafe { (*inner.slot(idx)).assume_init_ref() }
     }
 }
 
 impl<T> IndexMut<usize> for BaseAppendList<T, variants::Index> {
     #[inline]
     fn index_mut(&mut self, idx: usize) -> &mut T {
-        let len = self.len();
-        self.get_mut(idx)
-            .unwrap_or_else(|| panic!("index {idx} out of bounds for list of length {len}"))
+        let inner = self.inner.get_mut();
+        if idx >= inner.len() {
+            index_out_of_bounds(idx, inner.len());
+        }
+        // SAFETY: as `index`, but a unique borrow of a single initialized slot.
+        unsafe { (*inner.slot(idx)).assume_init_mut() }
     }
+}
+
+/// Out-of-line so the panic's arguments do not have to be kept live (and
+/// spilled) across an indexing loop.
+#[cold]
+#[inline(never)]
+fn index_out_of_bounds(idx: usize, len: usize) -> ! {
+    panic!("index {idx} out of bounds for list of length {len}")
 }
 
 // ---------------------------------------------------------------------------
@@ -343,7 +354,19 @@ impl<T> IndexMut<usize> for BaseAppendList<T, variants::Index> {
 
 struct Inner<T> {
     len: usize,
-    chunks: Vec<Chunk<T>>,
+    /// Next free slot: where the following `push` writes. Equal to `end` when
+    /// the batch holding element `len` is full or not yet allocated, which is
+    /// the only case `push` has to leave its fast path for.
+    next: *mut MaybeUninit<T>,
+    /// One past the last slot of the batch that `next` points into.
+    end: *mut MaybeUninit<T>,
+    /// One entry per allocated batch, where batch `b` holds `CHUNK_SIZE << b`
+    /// elements starting at element `batch_start(b)`. Entries are *biased*: each
+    /// stores `base - batch_start(b)`, so the slot for an index is just
+    /// `batches[batch_of(index)] + index` — one load and one add, with the
+    /// per-batch offset folded in at allocation time. Only ~log2(len) entries,
+    /// so this table stays cache-resident.
+    batches: Vec<*mut MaybeUninit<T>>,
 }
 
 impl<T> Default for Inner<T> {
@@ -351,7 +374,9 @@ impl<T> Default for Inner<T> {
     fn default() -> Self {
         Self {
             len: 0,
-            chunks: Vec::new(),
+            next: core::ptr::null_mut(),
+            end: core::ptr::null_mut(),
+            batches: Vec::new(),
         }
     }
 }
@@ -364,45 +389,100 @@ impl<T> Inner<T> {
 
     #[inline(always)]
     fn capacity(&self) -> usize {
-        self.chunks.len() * CHUNK_SIZE
+        batch_start(self.batches.len())
     }
 
     /// Raw pointer to the slot at `index`.
     ///
     /// # Safety
-    /// The chunk holding `index` must already exist (`index < capacity`).
+    /// The batch holding `index` must already exist (`index < capacity`).
     #[inline(always)]
     unsafe fn slot(&self, index: usize) -> *mut MaybeUninit<T> {
-        let chunk_index = index / CHUNK_SIZE;
-        let index_in_chunk = index & CHUNK_MASK;
-        // SAFETY: caller guarantees the chunk exists; `index_in_chunk < CHUNK_SIZE`.
-        unsafe { self.chunks.get_unchecked(chunk_index).slot(index_in_chunk) }
+        // SAFETY: caller guarantees the batch exists; unbiasing lands inside it
+        // by construction (`batch_of` is the inverse of `batch_start`).
+        unsafe { (*self.batches.get_unchecked(batch_of(index))).wrapping_add(index) }
+    }
+
+    /// The run of contiguous slots starting at `index` and stopping at the end
+    /// of its batch or at `end`, whichever comes first: a pointer to the first
+    /// slot and the number of slots.
+    ///
+    /// # Safety
+    /// `index < end` and `end <= capacity`.
+    #[inline]
+    unsafe fn run_from(&self, index: usize, end: usize) -> (*mut MaybeUninit<T>, usize) {
+        let batch = batch_of(index);
+        let batch_end = batch_start(batch) + batch_len(batch);
+        // SAFETY: `index < end <= capacity`, so this batch is allocated.
+        (
+            unsafe { self.slot(index) },
+            core::cmp::min(batch_end, end) - index,
+        )
+    }
+
+    /// Real base pointer of batch `batch` (the biased entry, unbiased).
+    ///
+    /// # Safety
+    /// `batch` must be an allocated batch.
+    #[inline(always)]
+    unsafe fn batch_base(&self, batch: usize) -> *mut MaybeUninit<T> {
+        // SAFETY: caller guarantees the batch exists.
+        unsafe { (*self.batches.get_unchecked(batch)).wrapping_add(batch_start(batch)) }
     }
 
     fn push(&mut self, item: T) -> &mut T {
-        // Zero-sized types have no storage to point stable references at.
-        const {
-            assert!(
-                core::mem::size_of::<T>() != 0,
-                "kappendlist does not support zero-sized types"
-            )
-        };
-
-        let index = self.len;
-        if index / CHUNK_SIZE >= self.chunks.len() {
-            // Double the number of chunks (allocate `len + 1` more). See
-            // `Chunk::alloc_batch` and the growth notes there.
-            self.allocate_chunks(self.chunks.len() + 1);
+        if self.next == self.end {
+            self.advance_cursor();
         }
 
-        // SAFETY: the chunk for `index` now exists; we form a `&mut` to this
-        // single, previously-uninitialized slot only, so no reference to any
-        // other (already-initialized) slot is invalidated.
+        // SAFETY: the cursor now points at a free, uninitialized slot inside an
+        // allocated batch. We form a `&mut` to that single slot only, so no
+        // reference to any other (already-initialized) slot is invalidated.
         unsafe {
-            let slot = self.slot(index);
+            let slot = self.next;
             (*slot).write(item);
+            self.next = slot.add(1);
             self.len += 1;
             (*slot).assume_init_mut()
+        }
+    }
+
+    /// Move the push cursor to the batch holding element `len`, allocating that
+    /// batch if it does not exist yet.
+    ///
+    /// Only reached when the current batch is exhausted, i.e. once per batch,
+    /// so `len` is always exactly at a batch boundary here.
+    #[cold]
+    #[inline(never)]
+    fn advance_cursor(&mut self) {
+        let batch = batch_of(self.len);
+        debug_assert_eq!(self.len, batch_start(batch));
+        if batch == self.batches.len() {
+            self.alloc_batch();
+        }
+        debug_assert!(batch < self.batches.len());
+        // SAFETY: allocated just above if it did not already exist.
+        let base = unsafe { self.batch_base(batch) };
+        self.next = base;
+        // SAFETY: `base` was allocated with room for `batch_len(batch)`
+        // elements, so this is the one-past-the-end pointer of that allocation.
+        self.end = unsafe { base.add(batch_len(batch)) };
+    }
+
+    /// Point the push cursor at element 0. Only valid when `len == 0`.
+    fn rewind_cursor(&mut self) {
+        debug_assert_eq!(self.len, 0);
+        match self.batches.first() {
+            // SAFETY: batch 0 starts at element 0, so its entry is unbiased,
+            // and it holds `CHUNK_SIZE` elements.
+            Some(&base) => {
+                self.next = base;
+                self.end = unsafe { base.add(batch_len(0)) };
+            }
+            None => {
+                self.next = core::ptr::null_mut();
+                self.end = core::ptr::null_mut();
+            }
         }
     }
 
@@ -433,27 +513,45 @@ impl<T> Inner<T> {
         unsafe { (*self.slot(index)).assume_init_read() }
     }
 
-    fn allocate_chunks(&mut self, count: usize) {
-        if count == 0 {
-            return;
+    /// Allocate the next batch (index `batches.len()`, holding
+    /// `CHUNK_SIZE << batches.len()` elements).
+    fn alloc_batch(&mut self) {
+        assert_not_zst::<T>();
+        let batch = self.batches.len();
+        let layout = batch_layout::<T>(batch_len(batch));
+        // SAFETY: `batch_len` is non-zero and `T` is not a ZST (checked in
+        // `push`), so the layout has non-zero size.
+        let base = unsafe { global_alloc(layout) } as *mut MaybeUninit<T>;
+        if base.is_null() {
+            handle_alloc_error(layout);
         }
-        // SAFETY: `count >= 1`, so `Chunk::alloc_batch` allocates a non-zero
-        // layout.
-        self.chunks.extend(unsafe { Chunk::alloc_batch(count) });
+        // Store it biased by the batch's first element index. Wrapping keeps the
+        // allocation's provenance; every use adds the bias back before any
+        // dereference, landing inside the allocation again.
+        self.batches.push(base.wrapping_sub(batch_start(batch)));
     }
 
     /// Ensure there is room for `additional` more elements beyond `len`.
+    ///
+    /// Capacity only ever lands on a batch boundary, so this rounds up to the
+    /// next one.
     fn reserve(&mut self, additional: usize) {
         let target_len = self
             .len
             .checked_add(additional)
             .expect("kappendlist capacity overflow");
-        let needed_chunks = target_len.div_ceil(CHUNK_SIZE);
-        if needed_chunks > self.chunks.len() {
-            // A single contiguous batch of exactly the shortfall; the tag scheme
-            // handles batches of any size.
-            self.allocate_chunks(needed_chunks - self.chunks.len());
+        if target_len <= self.capacity() {
+            return;
         }
+        // Smallest batch count whose combined capacity covers `target_len`.
+        // `target_len >= 1` here, since it exceeds a capacity of at least 0.
+        let needed = batch_of(target_len - 1) + 1;
+        while self.batches.len() < needed {
+            self.alloc_batch();
+        }
+        // The cursor is left alone on purpose: if it was live it still points
+        // at element `len`, and if it was exhausted the next `push` re-derives
+        // it (and now finds the batch already allocated).
     }
 
     fn extend<I: IntoIterator<Item = T>>(&mut self, iter: I) {
@@ -472,150 +570,73 @@ impl<T> Drop for Inner<T> {
             // SAFETY: `index < len` ⇒ the slot is initialized and dropped once.
             unsafe { (*self.slot(index)).assume_init_drop() };
         }
-        // Free the underlying chunk allocations.
-        // SAFETY: chunks were produced by `Chunk::alloc_batch` and are freed
-        // exactly once here.
-        unsafe { Chunk::dealloc_all(&self.chunks) };
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Chunk: a tagged pointer to a CHUNK_SIZE-element buffer
-// ---------------------------------------------------------------------------
-
-/// Alignment we steal the low bits of the chunk pointer below. We request at
-/// least this alignment from the allocator so tagging never clobbers a real
-/// address bit.
-const TAG_ALIGN: usize = 8;
-const TAG_MASK: usize = TAG_ALIGN - 1;
-
-const _: () = assert!(TAG_ALIGN.is_power_of_two());
-
-/// A pointer to one `CHUNK_SIZE`-element buffer of `MaybeUninit<T>`.
-///
-/// Chunks are allocated in contiguous batches. The pointer of the *first* chunk
-/// of each batch has its low bit set (tag `1`); every other chunk is untagged
-/// (tag `0`). This lets [`dealloc_all`](Chunk::dealloc_all) recover batch
-/// boundaries — and thus the original allocation size — when freeing.
-struct Chunk<T> {
-    /// Possibly-tagged pointer to the first element of this chunk's buffer.
-    ptr: *mut MaybeUninit<T>,
-}
-
-/// Layout for a batch of `count` contiguous chunks, over-aligned to
-/// [`TAG_ALIGN`] so the low bits are free for tagging.
-#[inline]
-fn batch_layout<T>(count: usize) -> Layout {
-    let elems = CHUNK_SIZE
-        .checked_mul(count)
-        .expect("kappendlist capacity overflow");
-    Layout::array::<T>(elems)
-        .expect("chunk layout size overflow")
-        .align_to(TAG_ALIGN)
-        .expect("chunk layout alignment overflow")
-}
-
-impl<T> Chunk<T> {
-    /// Allocate `count` contiguous chunks and yield one [`Chunk`] handle each,
-    /// the first of which carries the batch tag.
-    ///
-    /// # Safety
-    /// `count` must be `>= 1` so the allocation layout has non-zero size.
-    unsafe fn alloc_batch(count: usize) -> impl Iterator<Item = Chunk<T>> {
-        debug_assert!(count >= 1);
-        let layout = batch_layout::<T>(count);
-        // SAFETY: `count >= 1` and `T` is not a ZST (checked in `push`), so the
-        // layout has non-zero size.
-        let base = unsafe { global_alloc(layout) } as *mut MaybeUninit<T>;
-        if base.is_null() {
-            handle_alloc_error(layout);
-        }
-        debug_assert_eq!(
-            addr_tag(base),
-            0,
-            "allocator returned an under-aligned pointer; tagging would corrupt it",
-        );
-        // The first chunk holds the tagged pointer; the rest are plain offsets
-        // (by whole chunks) into the same allocation.
-        core::iter::once(Chunk {
-            ptr: with_tag(base, 1),
-        })
-        .chain((1..count).map(move |i| Chunk {
-            // SAFETY: `i < count`, so `i * CHUNK_SIZE` stays within the batch
-            // allocation of `count * CHUNK_SIZE` elements.
-            ptr: unsafe { base.add(i * CHUNK_SIZE) },
-        }))
-    }
-
-    /// The tag bits of this chunk's pointer (`1` for a batch head, else `0`).
-    #[inline(always)]
-    fn tag(&self) -> usize {
-        addr_tag(self.ptr)
-    }
-
-    /// The real (untagged) base pointer of this chunk's buffer.
-    #[inline(always)]
-    fn base(&self) -> *mut MaybeUninit<T> {
-        untag(self.ptr)
-    }
-
-    /// Raw pointer to element `i` within this chunk.
-    ///
-    /// # Safety
-    /// `i` must be `< CHUNK_SIZE`.
-    #[inline(always)]
-    unsafe fn slot(&self, i: usize) -> *mut MaybeUninit<T> {
-        debug_assert!(i < CHUNK_SIZE);
-        // SAFETY: caller guarantees `i < CHUNK_SIZE`, within this chunk's buffer.
-        unsafe { self.base().add(i) }
-    }
-
-    /// Free every batch backing `chunks`.
-    ///
-    /// # Safety
-    /// `chunks` must be exactly the chunks produced by `alloc_batch` calls, in
-    /// allocation order, and must not be freed again.
-    unsafe fn dealloc_all(chunks: &[Chunk<T>]) {
-        if chunks.is_empty() {
-            return;
-        }
-        debug_assert_eq!(chunks[0].tag(), 1, "first chunk is not a batch head");
-        // Walk backwards, counting chunks until we hit a batch head, then free
-        // that whole batch with the layout it was allocated with.
-        let mut count = 0;
-        for chunk in chunks.iter().rev() {
-            count += 1;
-            if chunk.tag() == 1 {
-                // SAFETY: `chunk` is a batch head allocated with this exact
-                // layout by `alloc_batch`, and is freed exactly once.
-                unsafe { global_dealloc(chunk.base().cast(), batch_layout::<T>(count)) };
-                count = 0;
+        // Free the underlying batch allocations.
+        for batch in 0..self.batches.len() {
+            // SAFETY: unbiasing recovers exactly the pointer `alloc_batch` got
+            // back (provenance included); it is freed exactly once, with the
+            // layout it was allocated with.
+            unsafe {
+                let base = self.batch_base(batch);
+                global_dealloc(base.cast(), batch_layout::<T>(batch_len(batch)));
             }
         }
-        debug_assert_eq!(count, 0, "trailing chunks without a batch head");
     }
 }
 
 // ---------------------------------------------------------------------------
-// Tagged-pointer helpers (provenance-preserving)
+// Batch geometry
 // ---------------------------------------------------------------------------
 
-/// The low tag bits of a pointer's address.
+/// Number of elements in the first batch. Must be a power of two. Batch `b`
+/// holds `CHUNK_SIZE << b` elements, so `n` batches hold `CHUNK_SIZE * (2^n - 1)`
+/// elements in total.
+const CHUNK_SIZE: usize = 16;
+const CHUNK_SHIFT: u32 = CHUNK_SIZE.trailing_zeros();
+
+const _: () = assert!(CHUNK_SIZE.is_power_of_two());
+
+/// Index of the batch holding element `index`.
+///
+/// `index` lives in batch `b` iff `2^b <= index / CHUNK_SIZE + 1 < 2^(b+1)`, so
+/// `b` is just the position of that value's highest set bit.
 #[inline(always)]
-fn addr_tag<T>(p: *mut T) -> usize {
-    p.addr() & TAG_MASK
+fn batch_of(index: usize) -> usize {
+    let scaled = (index >> CHUNK_SHIFT) + 1;
+    (usize::BITS - 1 - scaled.leading_zeros()) as usize
 }
 
-/// Clear the tag bits, preserving provenance.
+/// Index of the first element of batch `batch` — equivalently, the total
+/// capacity of the `batch` batches before it.
 #[inline(always)]
-fn untag<T>(p: *mut T) -> *mut T {
-    p.map_addr(|a| a & !TAG_MASK)
+fn batch_start(batch: usize) -> usize {
+    // `CHUNK_SIZE * (2^batch - 1)`, written to stay correct for `batch == 0`.
+    (CHUNK_SIZE << batch) - CHUNK_SIZE
 }
 
-/// Set the given tag bits, preserving provenance.
+/// Number of elements in batch `batch`.
 #[inline(always)]
-fn with_tag<T>(p: *mut T, tag: usize) -> *mut T {
-    p.map_addr(|a| a | (tag & TAG_MASK))
+fn batch_len(batch: usize) -> usize {
+    CHUNK_SIZE << batch
+}
+
+/// Zero-sized types have no storage to point stable references at, and a batch
+/// of them would be a zero-sized allocation. Every path that allocates storage
+/// or measures a distance between slots calls this, so using a ZST fails at
+/// monomorphization time rather than misbehaving at run time.
+#[inline(always)]
+fn assert_not_zst<T>() {
+    const {
+        assert!(
+            core::mem::size_of::<T>() != 0,
+            "kappendlist does not support zero-sized types"
+        )
+    };
+}
+
+/// Layout of a batch holding `elems` elements.
+#[inline]
+fn batch_layout<T>(elems: usize) -> Layout {
+    Layout::array::<T>(elems).expect("kappendlist capacity overflow")
 }
 
 // ---------------------------------------------------------------------------
@@ -694,13 +715,88 @@ impl<T: Debug> Debug for BaseAppendList<T, variants::Index> {
 /// list may grow during iteration, this iterator is intentionally neither
 /// [`ExactSizeIterator`] nor [`FusedIterator`].
 ///
-/// Element-wise `next` uses the simple indexed path. A chunk-walking iterator
-/// and a `fold` override were both tried and benchmarked; the optimizer already
-/// vectorizes this simple loop better than either, so the simple version stays.
+/// `next` walks a run of contiguous slots (a batch, capped by the length
+/// observed when the run was entered) with a pointer bump, and only re-reads the
+/// list's length when it reaches the end of a run — which is what makes
+/// appending mid-iteration observable while keeping the common step branch-light.
 pub struct Iter<'a, T> {
     inner: *const Inner<T>,
-    index: usize,
+    /// Next slot to yield; `null` before the first run is entered.
+    ptr: *const MaybeUninit<T>,
+    /// One past the last slot of the current run.
+    limit: *const MaybeUninit<T>,
+    /// Index one past the current run's last element. The current index is
+    /// `run_end - (limit - ptr)`, so stepping costs a pointer bump and nothing
+    /// else — the index is only reconstructed off the hot path.
+    run_end: usize,
     _marker: PhantomData<&'a Inner<T>>,
+}
+
+impl<'a, T> Iter<'a, T> {
+    #[inline]
+    fn new(inner: *const Inner<T>) -> Self {
+        Iter {
+            inner,
+            // Both null: the first `next` takes the run-refresh path, where
+            // `ptr == limit` makes the starting index `run_end == 0`.
+            ptr: core::ptr::null(),
+            limit: core::ptr::null(),
+            run_end: 0,
+            _marker: PhantomData,
+        }
+    }
+
+    /// Number of elements left in the current run.
+    #[inline]
+    fn left_in_run(&self) -> usize {
+        assert_not_zst::<T>();
+        (self.limit.addr() - self.ptr.addr()) / core::mem::size_of::<T>()
+    }
+
+    /// Index of the element `next` would yield.
+    #[inline]
+    fn index(&self) -> usize {
+        self.run_end - self.left_in_run()
+    }
+
+    /// End of the current run: re-read the length and enter the run holding
+    /// `index`, if there is one.
+    #[cold]
+    #[inline(never)]
+    fn next_run(&mut self) -> Option<&'a T> {
+        // SAFETY: `inner` is valid for `'a`; the transient `&Inner` is dropped
+        // before returning.
+        let inner = unsafe { &*self.inner };
+        let len = inner.len;
+        // `ptr == limit` here, so the current index is exactly `run_end`.
+        let index = self.run_end;
+        if index >= len {
+            return None;
+        }
+        // SAFETY: `index < len <= capacity`, so the run is allocated, and every
+        // slot in it is initialized (the run stops at `len`).
+        unsafe {
+            let (ptr, run_len) = inner.run_from(index, len);
+            self.ptr = ptr.cast_const();
+            self.limit = self.ptr.add(run_len);
+            self.run_end = index + run_len;
+            self.yield_next()
+        }
+    }
+
+    /// Yield the slot at `ptr` and step past it.
+    ///
+    /// # Safety
+    /// `ptr` must point at an initialized slot inside a live batch.
+    #[inline(always)]
+    unsafe fn yield_next(&mut self) -> Option<&'a T> {
+        // SAFETY: the slot is initialized and lives in stable batch storage
+        // that outlives `'a`, so the borrow may be extended to `'a`.
+        let item = unsafe { &*self.ptr.cast::<T>() };
+        // SAFETY: `ptr < limit`, so stepping stays within the allocation.
+        self.ptr = unsafe { self.ptr.add(1) };
+        Some(item)
+    }
 }
 
 impl<'a, T> Iterator for Iter<'a, T> {
@@ -708,19 +804,52 @@ impl<'a, T> Iterator for Iter<'a, T> {
 
     #[inline]
     fn next(&mut self) -> Option<&'a T> {
-        // SAFETY: `inner` is valid for `'a`; we form a transient `&Inner` and
-        // extend the element borrow to `'a`, which is sound because the element
-        // lives in stable chunk storage that outlives `'a`.
-        let inner = unsafe { &*self.inner };
-        let item = inner.get(self.index)?;
-        self.index += 1;
-        Some(unsafe { &*(item as *const T) })
+        if self.ptr == self.limit {
+            return self.next_run();
+        }
+        // SAFETY: `ptr < limit` ⇒ it points at an initialized slot of the run.
+        unsafe { self.yield_next() }
+    }
+
+    /// Consumers built on `fold` (`sum`, `for_each`, `collect`, …) get to see
+    /// each run as a plain slice, which the optimizer can unroll and vectorize
+    /// the way it does for `Vec`. Runs are still re-derived from the current
+    /// length between batches, so elements appended by `f` are still observed.
+    #[inline]
+    fn fold<B, F>(mut self, init: B, mut f: F) -> B
+    where
+        F: FnMut(B, Self::Item) -> B,
+    {
+        let mut acc = init;
+        loop {
+            if self.ptr == self.limit {
+                // Between runs: re-read the length and enter the next one.
+                match self.next_run() {
+                    Some(item) => acc = f(acc, item),
+                    None => return acc,
+                }
+            } else {
+                // SAFETY: `ptr < limit`, so `ptr` is non-null and the run
+                // `[ptr, limit)` is entirely initialized and stays valid: the
+                // only thing `f` can do to the list is append, which writes to
+                // slots past `limit`.
+                let run: &'a [T] = unsafe {
+                    core::slice::from_raw_parts(self.ptr.cast::<T>(), self.left_in_run())
+                };
+                // Consume the run up-front so `self` stays consistent for any
+                // `next_run` after `f` appends.
+                self.ptr = self.limit;
+                for item in run {
+                    acc = f(acc, item);
+                }
+            }
+        }
     }
 
     #[inline]
     fn size_hint(&self) -> (usize, Option<usize>) {
         // SAFETY: `inner` is valid for `'a`.
-        let remaining = unsafe { &*self.inner }.len().saturating_sub(self.index);
+        let remaining = unsafe { &*self.inner }.len().saturating_sub(self.index());
         (remaining, Some(remaining))
     }
 }
@@ -758,6 +887,29 @@ impl<'a, T> Iterator for IterMut<'a, T> {
     fn size_hint(&self) -> (usize, Option<usize>) {
         let remaining = self.end - self.index;
         (remaining, Some(remaining))
+    }
+
+    /// See [`Iter::fold`]: consumers built on `fold` get whole runs as slices.
+    #[inline]
+    fn fold<B, F>(mut self, init: B, mut f: F) -> B
+    where
+        F: FnMut(B, Self::Item) -> B,
+    {
+        let mut acc = init;
+        while self.index < self.end {
+            // SAFETY: created from `&'a mut self`, so we have exclusive access
+            // for `'a`, and `index < end <= len` makes the run initialized.
+            // Runs are disjoint, so the extended borrows never alias.
+            let run: &'a mut [T] = unsafe {
+                let (ptr, run_len) = (*self.inner).run_from(self.index, self.end);
+                core::slice::from_raw_parts_mut(ptr.cast::<T>(), run_len)
+            };
+            self.index += run.len();
+            for item in run {
+                acc = f(acc, item);
+            }
+        }
+        acc
     }
 }
 
@@ -807,6 +959,29 @@ impl<T> Iterator for Drain<'_, T> {
     fn size_hint(&self) -> (usize, Option<usize>) {
         let remaining = self.len - self.index;
         (remaining, Some(remaining))
+    }
+
+    /// Move the elements out a run at a time. The consumed count is bumped
+    /// before each element is handed over, so a panic in `f` still leaves
+    /// `Drop` with an accurate range to clean up.
+    #[inline]
+    fn fold<B, F>(mut self, init: B, mut f: F) -> B
+    where
+        F: FnMut(B, T) -> B,
+    {
+        let mut acc = init;
+        while self.index < self.len {
+            // SAFETY: `index < len <= the length at construction`, so the whole
+            // run is initialized and has not been moved out of yet.
+            let (ptr, run_len) = unsafe { (*self.inner).run_from(self.index, self.len) };
+            for i in 0..run_len {
+                // SAFETY: `i < run_len`, so this slot is inside the run.
+                let item = unsafe { ptr.add(i).read().assume_init() };
+                self.index += 1;
+                acc = f(acc, item);
+            }
+        }
+        acc
     }
 }
 
@@ -861,6 +1036,29 @@ impl<T> Iterator for IntoIter<T> {
     fn size_hint(&self) -> (usize, Option<usize>) {
         let remaining = self.len - self.index;
         (remaining, Some(remaining))
+    }
+
+    /// Move the elements out a run at a time. The consumed count is bumped
+    /// before each element is handed over, so a panic in `f` still leaves
+    /// `Drop` with an accurate range to clean up.
+    #[inline]
+    fn fold<B, F>(mut self, init: B, mut f: F) -> B
+    where
+        F: FnMut(B, T) -> B,
+    {
+        let mut acc = init;
+        while self.index < self.len {
+            // SAFETY: `index < len <= the length at construction`, so the whole
+            // run is initialized and has not been moved out of yet.
+            let (ptr, run_len) = unsafe { self.inner.run_from(self.index, self.len) };
+            for i in 0..run_len {
+                // SAFETY: `i < run_len`, so this slot is inside the run.
+                let item = unsafe { ptr.add(i).read().assume_init() };
+                self.index += 1;
+                acc = f(acc, item);
+            }
+        }
+        acc
     }
 }
 
@@ -1153,6 +1351,83 @@ mod test {
     }
 
     #[test]
+    fn fold_observes_appends_within_a_batch() {
+        // `for_each` goes through `fold`, which walks whole runs as slices.
+        // Element 17 lives in the same batch as the slots the pushes below
+        // write to, so this covers appending *into the batch being walked*.
+        let l: AppendList<usize> = (0..20).collect();
+        let mut seen = Vec::new();
+        l.iter().for_each(|&x| {
+            seen.push(x);
+            if x == 17 {
+                for y in 20..30 {
+                    l.push(y);
+                }
+            }
+        });
+        assert_eq!(seen, (0..30).collect::<Vec<_>>());
+    }
+
+    #[test]
+    // The explicit `fold`s are the point: they exercise the overrides.
+    #[allow(clippy::unnecessary_fold)]
+    fn fold_matches_next_over_many_batches() {
+        let l: AppendList<usize> = (0..1_000).collect();
+        // `sum` uses `fold`; the manual loop uses `next`. They must agree.
+        let via_fold: usize = l.iter().copied().sum();
+        let mut via_next = 0;
+        for &x in l.iter() {
+            via_next += x;
+        }
+        assert_eq!(via_fold, via_next);
+        assert_eq!(via_fold, (0..1_000).sum::<usize>());
+
+        let mut m: AppendList<usize> = (0..1_000).collect();
+        assert_eq!(m.iter_mut().fold(0, |a, x| a + *x), via_fold);
+        assert_eq!(m.drain_all().fold(0, |a, x| a + x), via_fold);
+
+        let o: AppendList<usize> = (0..1_000).collect();
+        assert_eq!(o.into_iter().fold(0, |a, x| a + x), via_fold);
+    }
+
+    #[test]
+    fn drain_fold_panic_drops_each_element_once() {
+        use std::cell::Cell;
+        use std::panic::{AssertUnwindSafe, catch_unwind};
+
+        let counter = Rc::new(Cell::new(0));
+
+        struct Bomb(Rc<Cell<usize>>);
+        impl Drop for Bomb {
+            fn drop(&mut self) {
+                self.0.set(self.0.get() + 1);
+            }
+        }
+
+        let mut l = AppendList::new();
+        for _ in 0..100 {
+            l.push(Bomb(counter.clone()));
+        }
+
+        // Panic partway through a folded drain: the elements already handed to
+        // the closure are dropped by it, the rest by `Drain::drop`.
+        let mut n = 0;
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            l.drain_all().fold((), |(), bomb| {
+                n += 1;
+                if n == 40 {
+                    panic!("boom");
+                }
+                drop(bomb);
+            })
+        }));
+
+        assert!(result.is_err());
+        assert_eq!(counter.get(), 100, "every element dropped exactly once");
+        assert!(l.is_empty());
+    }
+
+    #[test]
     fn drain_partial_drops_remainder() {
         use std::cell::Cell;
 
@@ -1201,7 +1476,7 @@ mod test {
         let l = AppendList::new();
         let mut refs: Vec<&usize> = Vec::new();
 
-        assert!(l.inner().chunks.is_empty());
+        assert!(l.inner().batches.is_empty());
         for i in 0..size {
             assert_eq!(l.len(), i);
 
@@ -1209,7 +1484,7 @@ mod test {
             assert_eq!(l.len(), i + 1);
 
             if size < 5_000 {
-                check_chunk_invariants(&l, l.len());
+                check_batch_invariants(&l, l.len());
             }
         }
 
@@ -1235,29 +1510,33 @@ mod test {
             l.capacity() / CHUNK_SIZE,
             (1 << ceil_log2(size / CHUNK_SIZE + 1)) - 1
         );
-        check_chunk_invariants(&l, size);
+        check_batch_invariants(&l, size);
 
         // The list is fully reusable after draining.
         l.push(1);
         assert_eq!(l.drain_all().collect::<Vec<_>>(), vec![1]);
     }
 
-    /// Check the chunk-tagging invariants for a list that has held (at its high
-    /// water mark) `element_count` elements via single pushes.
-    fn check_chunk_invariants(l: &AppendList<usize>, element_count: usize) {
+    /// Check the batch-geometry invariants for a list that has held (at its
+    /// high water mark) `element_count` elements.
+    fn check_batch_invariants(l: &AppendList<usize>, element_count: usize) {
         let inner = l.inner();
-        // The number of chunks matches the growth formula.
-        assert_eq!(
-            inner.chunks.len(),
-            chunks_to_reach(element_count.div_ceil(CHUNK_SIZE))
-        );
-        // The number of batch-head chunks is log2 of the chunk count.
-        assert_eq!(
-            inner.chunks.iter().filter(|c| c.tag() == 1).count(),
-            ceil_log2(inner.chunks.len())
-        );
-        // Tags are only ever 0 or 1.
-        assert_eq!(inner.chunks.iter().filter(|c| c.tag() > 1).count(), 0);
+        // One batch per doubling: `n` batches hold 16 * (2^n - 1) elements.
+        let expected_batches = if element_count == 0 {
+            0
+        } else {
+            ceil_log2(element_count.div_ceil(CHUNK_SIZE))
+        };
+        assert_eq!(inner.batches.len(), expected_batches);
+        assert_eq!(inner.capacity(), batch_start(inner.batches.len()));
+        assert!(inner.capacity() >= element_count);
+        // Every index maps back into an allocated batch that claims to hold it.
+        for i in 0..element_count.min(200) {
+            let batch = batch_of(i);
+            assert!(batch < inner.batches.len());
+            assert!(batch_start(batch) <= i);
+            assert!(i < batch_start(batch) + batch_len(batch));
+        }
     }
 
     /// Total chunks a pure doubling-growth list ends up with once it holds at
