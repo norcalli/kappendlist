@@ -319,12 +319,13 @@ impl<T> Index<usize> for BaseAppendList<T, variants::Index> {
     #[inline]
     fn index(&self, idx: usize) -> &T {
         let inner = self.inner();
+        let table = inner.batches.as_ptr();
         if idx >= inner.len() {
             index_out_of_bounds(idx, inner.len());
         }
         // SAFETY: bounds-checked just above, so the slot exists and is
         // initialized; we form a `&` to that single slot only.
-        unsafe { (*inner.slot(idx)).assume_init_ref() }
+        unsafe { (*Inner::slot_in(table, idx)).assume_init_ref() }
     }
 }
 
@@ -332,11 +333,12 @@ impl<T> IndexMut<usize> for BaseAppendList<T, variants::Index> {
     #[inline]
     fn index_mut(&mut self, idx: usize) -> &mut T {
         let inner = self.inner.get_mut();
+        let table = inner.batches.as_ptr();
         if idx >= inner.len() {
             index_out_of_bounds(idx, inner.len());
         }
         // SAFETY: as `index`, but a unique borrow of a single initialized slot.
-        unsafe { (*inner.slot(idx)).assume_init_mut() }
+        unsafe { (*Inner::slot_in(table, idx)).assume_init_mut() }
     }
 }
 
@@ -398,9 +400,25 @@ impl<T> Inner<T> {
     /// The batch holding `index` must already exist (`index < capacity`).
     #[inline(always)]
     unsafe fn slot(&self, index: usize) -> *mut MaybeUninit<T> {
+        // SAFETY: forwarded to `slot_in`.
+        unsafe { Self::slot_in(self.batches.as_ptr(), index) }
+    }
+
+    /// Raw pointer to the slot at `index`, given the batch table's base pointer.
+    ///
+    /// Callers that also have to bounds-check read `batches.as_ptr()` *before*
+    /// the check: the field read is unconditionally safe, and keeping it out of
+    /// the guarded region is what lets the optimizer hoist it out of an indexing
+    /// loop instead of reloading it every iteration.
+    ///
+    /// # Safety
+    /// `table` must be the current batch table, and the batch holding `index`
+    /// must exist (`index < capacity`).
+    #[inline(always)]
+    unsafe fn slot_in(table: *const *mut MaybeUninit<T>, index: usize) -> *mut MaybeUninit<T> {
         // SAFETY: caller guarantees the batch exists; unbiasing lands inside it
         // by construction (`batch_of` is the inverse of `batch_start`).
-        unsafe { (*self.batches.get_unchecked(batch_of(index))).wrapping_add(index) }
+        unsafe { (*table.add(batch_of(index))).wrapping_add(index) }
     }
 
     /// The run of contiguous slots starting at `index` and stopping at the end
@@ -487,20 +505,22 @@ impl<T> Inner<T> {
     }
 
     fn get(&self, index: usize) -> Option<&T> {
+        let table = self.batches.as_ptr();
         if index >= self.len {
             return None;
         }
         // SAFETY: `index < len` ⇒ the slot exists and is initialized. We form a
         // `&` to this single slot only.
-        Some(unsafe { (*self.slot(index)).assume_init_ref() })
+        Some(unsafe { (*Self::slot_in(table, index)).assume_init_ref() })
     }
 
     fn get_mut(&mut self, index: usize) -> Option<&mut T> {
+        let table = self.batches.as_ptr();
         if index >= self.len {
             return None;
         }
         // SAFETY: as `get`, but a unique borrow of a single initialized slot.
-        Some(unsafe { (*self.slot(index)).assume_init_mut() })
+        Some(unsafe { (*Self::slot_in(table, index)).assume_init_mut() })
     }
 
     /// Move the initialized element at `index` out of the list.

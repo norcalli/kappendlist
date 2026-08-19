@@ -32,6 +32,11 @@ Initial (unpublished) `0.1.0`.
   `for_each`, `collect` and other `fold`-based consumers vectorize.
 - `Index`/`IndexMut` bounds-check directly instead of going through
   `Option::unwrap_or_else`, which had forced a spill on every indexed access.
+- `get`/`Index` read the batch table's base pointer before bounds-checking.
+  Behind the check the load was not speculatable, so it was reloaded on every
+  access; ahead of it the optimizer hoists it out of an indexing loop — and then
+  also hoists the bounds check and unrolls. Indexed `get` in a loop is ~1.7x
+  faster.
 - `reserve` now rounds capacity up to a batch boundary (`16 * (2^n - 1)`
   elements) — the same schedule repeated pushes follow — so it may reserve up to
   twice what was asked for. Untouched slots are never written, so this costs
